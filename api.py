@@ -264,19 +264,42 @@ class TelegramAuthRequest(BaseModel):
     init_data: str
 
 def verify_telegram_web_app_data(init_data: str, bot_token: str) -> Optional[dict]:
+    """
+    Верификация подписи Telegram Web App по официальной документации:
+    https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+    """
     try:
-        parsed_data = dict(urllib.parse.parse_qsl(init_data))
-        if "hash" not in parsed_data: return None
+        import json
+        parsed_data = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        if "hash" not in parsed_data:
+            return None
+
         hash_val = parsed_data.pop("hash")
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
-        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-        calc_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        
-        if calc_hash == hash_val:
-            import json
-            return json.loads(parsed_data.get("user", "{}"))
-        return None
-    except Exception:
+        data_check_string = "\n".join(
+            f"{k}={v}" for k, v in sorted(parsed_data.items())
+        )
+
+        # Правильный алгоритм: secret_key = HMAC-SHA256("WebAppData", bot_token)
+        secret_key = hmac.new(
+            key=b"WebAppData",
+            msg=bot_token.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).digest()
+
+        calc_hash = hmac.new(
+            key=secret_key,
+            msg=data_check_string.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(calc_hash, hash_val):
+            return None
+
+        user_str = parsed_data.get("user", "{}")
+        return json.loads(user_str)
+
+    except Exception as e:
+        print(f"[TG verify] Ошибка верификации: {e}")
         return None
 
 @app.post("/api/auth/telegram")
@@ -655,12 +678,17 @@ if _site_dir.exists():
 
 
 # ══════════════════════════════════════════════════════════════════
-# ЗАПУСК
+# ИНИЦИАЛИЗАЦИЯ БД — запускается при старте модуля (Railway/gunicorn)
+# ══════════════════════════════════════════════════════════════════
+
+init_db()
+
+
+# ══════════════════════════════════════════════════════════════════
+# ЗАПУСК (локально)
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    init_db()
-
     import uvicorn
     uvicorn.run(
         "api:app",
