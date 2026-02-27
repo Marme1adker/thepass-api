@@ -572,7 +572,10 @@ async def _notify_tg(tg_uid: int, text: str):
 # ══════════════════════════════════════════════════════════════════
 
 # Раздаём загруженные аватары
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# Раздаём загруженные аватары
+upload_base = Path(DB_DIR) / "uploads"
+upload_base.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(upload_base)), name="uploads")
 
 # Раздаём сам сайт (index.html и все .js/.css)
 # Папку "site" создай рядом с api.py и положи туда все файлы сайта
