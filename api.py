@@ -73,11 +73,12 @@ def get_db():
 
 
 def init_db():
-    """Создаёт таблицы если не существуют."""
+    """Создаёт таблицы и патчит их, если они старые."""
     with get_db() as db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id           TEXT PRIMARY KEY,
+                num_id       INTEGER UNIQUE,
                 login        TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 username     TEXT,
@@ -92,14 +93,12 @@ def init_db():
                 active       INTEGER NOT NULL DEFAULT 1,
                 note         TEXT DEFAULT ''
             );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 token     TEXT PRIMARY KEY,
                 user_id   TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS audit_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    TEXT,
@@ -109,6 +108,13 @@ def init_db():
                 ts         TEXT NOT NULL
             );
         """)
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN num_id INTEGER")
+            users = db.execute("SELECT id FROM users ORDER BY created_at").fetchall()
+            for i, u in enumerate(users, 1):
+                db.execute("UPDATE users SET num_id=? WHERE id=?", (i, u[0]))
+        except Exception:
+            pass
     print("✅ БД инициализирована:", DB_PATH)
 
 
@@ -252,6 +258,68 @@ class AdminSetCreditsRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 # ЭНДПОИНТЫ — АВТОРИЗАЦИЯ
 # ══════════════════════════════════════════════════════════════════
+# ── Бесшовный вход через Telegram Web App ─────────────────────────
+
+class TelegramAuthRequest(BaseModel):
+    init_data: str
+
+def verify_telegram_web_app_data(init_data: str, bot_token: str) -> Optional[dict]:
+    try:
+        parsed_data = dict(urllib.parse.parse_qsl(init_data))
+        if "hash" not in parsed_data: return None
+        hash_val = parsed_data.pop("hash")
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        calc_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        
+        if calc_hash == hash_val:
+            import json
+            return json.loads(parsed_data.get("user", "{}"))
+        return None
+    except Exception:
+        return None
+
+@app.post("/api/auth/telegram")
+async def auth_telegram(body: TelegramAuthRequest, request: Request):
+    if not TG_BOT_TOKEN:
+        raise HTTPException(500, "TG_TOKEN не настроен на сервере")
+
+    tg_user = verify_telegram_web_app_data(body.init_data, TG_BOT_TOKEN)
+    if not tg_user or "id" not in tg_user:
+        raise HTTPException(401, "Недействительная подпись")
+
+    tg_uid = tg_user["id"]
+    
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE tg_uid=? AND active=1", (tg_uid,)).fetchone()
+        
+        if not row:
+            uid = gen_id()
+            login = f"tg_{tg_uid}"
+            password = gen_password(16)
+            pwd_hash = hash_password(password)
+            username = tg_user.get("first_name", f"User{tg_uid}")[:32]
+            now = datetime.utcnow().isoformat()
+            
+            # Получаем следующий ID
+            max_id = db.execute("SELECT MAX(num_id) FROM users").fetchone()
+            num_id = (max_id[0] or 0) + 1
+
+            db.execute("""
+                INSERT INTO users
+                  (id, num_id, login, password_hash, username, role, credits, tg_uid,
+                   created_at, changed_password, active, note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (uid, num_id, login, pwd_hash, username, "user", 0, tg_uid, now, 0, 1, ""))
+            row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            log_action(db, uid, "register_telegram")
+
+        token = make_token(row["id"])
+        user  = row_to_user(row)
+        log_action(db, row["id"], "login_telegram", ip=request.client.host if request.client else "")
+
+    return {"token": token, "user": user}
+
 
 @app.post("/api/auth/login")
 async def login(body: LoginRequest, request: Request):
