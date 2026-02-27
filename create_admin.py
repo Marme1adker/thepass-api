@@ -4,7 +4,7 @@ import uuid
 import os
 from datetime import datetime
 
-# Если папка /app/data существует (мы на Railway с Volume), сохраняем туда.
+# Настройки путей (с поддержкой Volume на Railway)
 DB_DIR = "/app/data" if os.path.exists("/app/data") else "."
 if os.path.exists("/app"):
     os.makedirs(DB_DIR, exist_ok=True)
@@ -20,7 +20,7 @@ USERNAME = "Admin"
 conn = sqlite3.connect(DB_PATH)
 conn.execute("PRAGMA journal_mode=WAL")
 
-# Создаём таблицу если нет
+# Создаем СРАЗУ ВСЕ необходимые таблицы
 conn.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id            TEXT PRIMARY KEY,
@@ -38,9 +38,25 @@ conn.executescript("""
         active        INTEGER NOT NULL DEFAULT 1,
         note          TEXT DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        token     TEXT PRIMARY KEY,
+        user_id   TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    TEXT,
+        action     TEXT NOT NULL,
+        detail     TEXT,
+        ip         TEXT,
+        ts         TEXT NOT NULL
+    );
 """)
 
-# Проверяем что такого логина ещё нет
+# Проверяем, существует ли админ
 existing = conn.execute("SELECT id FROM users WHERE login=?", (LOGIN,)).fetchone()
 if existing:
     print(f"⚠️ Пользователь '{LOGIN}' уже существует.")
@@ -53,6 +69,6 @@ else:
         VALUES (?,?,?,?,?,?,?,?,?,?)
     """, (uid, LOGIN, pwd, USERNAME, 'admin', 999, datetime.utcnow().isoformat(), 0, 1, ''))
     conn.commit()
-    print(f"✅ Админ создан!")
+    print(f"✅ База данных инициализирована. Админ создан!")
 
 conn.close()
