@@ -19,8 +19,6 @@ import aiofiles
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-import urllib.parse
-import hmac
 
 import bcrypt
 import sqlite3
@@ -42,10 +40,8 @@ JWT_SECRET    = os.getenv("JWT_SECRET", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_H  = 24 * 7   # 7 дней
 
-DB_DIR        = "/app/data" if os.path.exists("/app/data") else "."
-DB_PATH       = os.path.join(DB_DIR, "thepass.db")
-
-UPLOAD_DIR    = Path(DB_DIR) / "uploads" / "avatars"
+DB_PATH       = "thepass.db"
+UPLOAD_DIR    = Path("uploads/avatars")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_AVATAR_MB = 5
@@ -73,12 +69,11 @@ def get_db():
 
 
 def init_db():
-    """Создаёт таблицы и патчит их, если они старые."""
+    """Создаёт таблицы если не существуют."""
     with get_db() as db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id           TEXT PRIMARY KEY,
-                num_id       INTEGER UNIQUE,
                 login        TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 username     TEXT,
@@ -93,12 +88,14 @@ def init_db():
                 active       INTEGER NOT NULL DEFAULT 1,
                 note         TEXT DEFAULT ''
             );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token     TEXT PRIMARY KEY,
                 user_id   TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS audit_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    TEXT,
@@ -107,14 +104,23 @@ def init_db():
                 ip         TEXT,
                 ts         TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS last_games (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                game_title TEXT NOT NULL,
+                game_img   TEXT,
+                game_group TEXT,
+                played_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id    TEXT PRIMARY KEY,
+                banner_url TEXT,
+                last_seen  TEXT,
+                is_online  INTEGER NOT NULL DEFAULT 0
+            );
         """)
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN num_id INTEGER")
-            users = db.execute("SELECT id FROM users ORDER BY created_at").fetchall()
-            for i, u in enumerate(users, 1):
-                db.execute("UPDATE users SET num_id=? WHERE id=?", (i, u[0]))
-        except Exception:
-            pass
     print("✅ БД инициализирована:", DB_PATH)
 
 
@@ -255,71 +261,14 @@ class AdminSetSubRequest(BaseModel):
 class AdminSetCreditsRequest(BaseModel):
     amount: int
 
+class LastGameRequest(BaseModel):
+    game_title: str
+    game_img:   Optional[str] = None
+    game_group: Optional[str] = None
+
 # ══════════════════════════════════════════════════════════════════
 # ЭНДПОИНТЫ — АВТОРИЗАЦИЯ
 # ══════════════════════════════════════════════════════════════════
-# ── Бесшовный вход через Telegram Web App ─────────────────────────
-
-class TelegramAuthRequest(BaseModel):
-    init_data: str
-
-def verify_telegram_web_app_data(init_data: str, bot_token: str) -> Optional[dict]:
-    try:
-        parsed_data = dict(urllib.parse.parse_qsl(init_data))
-        if "hash" not in parsed_data: return None
-        hash_val = parsed_data.pop("hash")
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
-        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-        calc_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        
-        if calc_hash == hash_val:
-            import json
-            return json.loads(parsed_data.get("user", "{}"))
-        return None
-    except Exception:
-        return None
-
-@app.post("/api/auth/telegram")
-async def auth_telegram(body: TelegramAuthRequest, request: Request):
-    if not TG_BOT_TOKEN:
-        raise HTTPException(500, "TG_TOKEN не настроен на сервере")
-
-    tg_user = verify_telegram_web_app_data(body.init_data, TG_BOT_TOKEN)
-    if not tg_user or "id" not in tg_user:
-        raise HTTPException(401, "Недействительная подпись")
-
-    tg_uid = tg_user["id"]
-    
-    with get_db() as db:
-        row = db.execute("SELECT * FROM users WHERE tg_uid=? AND active=1", (tg_uid,)).fetchone()
-        
-        if not row:
-            uid = gen_id()
-            login = f"tg_{tg_uid}"
-            password = gen_password(16)
-            pwd_hash = hash_password(password)
-            username = tg_user.get("first_name", f"User{tg_uid}")[:32]
-            now = datetime.utcnow().isoformat()
-            
-            # Получаем следующий ID
-            max_id = db.execute("SELECT MAX(num_id) FROM users").fetchone()
-            num_id = (max_id[0] or 0) + 1
-
-            db.execute("""
-                INSERT INTO users
-                  (id, num_id, login, password_hash, username, role, credits, tg_uid,
-                   created_at, changed_password, active, note)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (uid, num_id, login, pwd_hash, username, "user", 0, tg_uid, now, 0, 1, ""))
-            row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-            log_action(db, uid, "register_telegram")
-
-        token = make_token(row["id"])
-        user  = row_to_user(row)
-        log_action(db, row["id"], "login_telegram", ip=request.client.host if request.client else "")
-
-    return {"token": token, "user": user}
-
 
 @app.post("/api/auth/login")
 async def login(body: LoginRequest, request: Request):
@@ -617,6 +566,174 @@ async def admin_logs(limit: int = 100, admin=Depends(require_admin)):
 
 
 # ══════════════════════════════════════════════════════════════════
+# ЭНДПОИНТЫ — LAST GAMES (история игр, не удаляется)
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/profile/last-games")
+async def add_last_game(body: LastGameRequest, user=Depends(require_user)):
+    """Добавить/обновить игру в last_games. Если уже есть — поднимает наверх."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        # Удаляем старую запись этой игры если есть
+        db.execute(
+            "DELETE FROM last_games WHERE user_id=? AND game_title=?",
+            (user["id"], body.game_title)
+        )
+        # Вставляем новую (она будет первой по played_at)
+        db.execute(
+            "INSERT INTO last_games (user_id, game_title, game_img, game_group, played_at) VALUES (?,?,?,?,?)",
+            (user["id"], body.game_title, body.game_img, body.game_group, now)
+        )
+        # Оставляем максимум 50 игр на пользователя
+        db.execute("""
+            DELETE FROM last_games WHERE user_id=? AND id NOT IN (
+                SELECT id FROM last_games WHERE user_id=? ORDER BY played_at DESC LIMIT 50
+            )
+        """, (user["id"], user["id"]))
+
+    return {"ok": True}
+
+
+@app.get("/api/profile/last-games")
+async def get_last_games(user=Depends(require_user)):
+    """Получить last_games текущего пользователя."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT game_title, game_img, game_group, played_at FROM last_games "
+            "WHERE user_id=? ORDER BY played_at DESC LIMIT 50",
+            (user["id"],)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/profile/last-games/{user_id}")
+async def get_last_games_by_user(user_id: str, current=Depends(require_user)):
+    """Получить last_games другого пользователя (для комьюнити)."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT game_title, game_img, game_group, played_at FROM last_games "
+            "WHERE user_id=? ORDER BY played_at DESC LIMIT 50",
+            (user_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════
+# ЭНДПОИНТЫ — ПРОФИЛЬ (баннер, онлайн-статус)
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/api/profile/banner")
+async def upload_banner(file: UploadFile = File(...), user=Depends(require_user)):
+    """Загрузить баннер профиля."""
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        raise HTTPException(400, "Только JPEG, PNG, WebP или GIF")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:  # 10MB для баннера
+        raise HTTPException(400, "Максимум 10 МБ")
+
+    banner_dir = Path("uploads/banners")
+    banner_dir.mkdir(parents=True, exist_ok=True)
+
+    ext      = file.filename.rsplit(".", 1)[-1].lower()
+    filename = f"{user['id']}_banner.{ext}"
+    path     = banner_dir / filename
+
+    async with aiofiles.open(path, "wb") as f:
+        await f.write(contents)
+
+    banner_url = f"/uploads/banners/{filename}"
+
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO user_profiles (user_id, banner_url) VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET banner_url=excluded.banner_url
+        """, (user["id"], banner_url))
+        log_action(db, user["id"], "upload_banner")
+
+    return {"banner_url": banner_url}
+
+
+@app.post("/api/profile/online")
+async def set_online(user=Depends(require_user)):
+    """Обновить онлайн-статус (вызывается при открытии сайта)."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO user_profiles (user_id, last_seen, is_online) VALUES (?, ?, 1)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen, is_online=1
+        """, (user["id"], now))
+    return {"ok": True}
+
+
+@app.post("/api/profile/offline")
+async def set_offline(user=Depends(require_user)):
+    """Обновить оффлайн-статус."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO user_profiles (user_id, last_seen, is_online) VALUES (?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen, is_online=0
+        """, (user["id"], now))
+    return {"ok": True}
+
+
+@app.get("/api/profile/{user_id}")
+async def get_user_profile(user_id: str, current=Depends(require_user)):
+    """Получить публичный профиль пользователя."""
+    with get_db() as db:
+        user_row = db.execute(
+            "SELECT id, login, username, role, sub_until, avatar_url, credits, created_at "
+            "FROM users WHERE id=? AND active=1",
+            (user_id,)
+        ).fetchone()
+        if not user_row:
+            raise HTTPException(404, "Пользователь не найден")
+
+        profile_row = db.execute(
+            "SELECT banner_url, last_seen, is_online FROM user_profiles WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+        games_count = db.execute(
+            "SELECT COUNT(*) as cnt FROM last_games WHERE user_id=?", (user_id,)
+        ).fetchone()["cnt"]
+
+    result = dict(user_row)
+    result.pop("password_hash", None)
+    if profile_row:
+        result["banner_url"] = profile_row["banner_url"]
+        result["last_seen"]  = profile_row["last_seen"]
+        result["is_online"]  = bool(profile_row["is_online"])
+    else:
+        result["banner_url"] = None
+        result["last_seen"]  = None
+        result["is_online"]  = False
+    result["games_count"] = games_count
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# ЭНДПОИНТЫ — КОМЬЮНИТИ
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/community/users")
+async def community_users(current=Depends(require_user)):
+    """Список всех активных пользователей для комьюнити."""
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT u.id, u.username, u.login, u.role, u.avatar_url, u.created_at,
+                   p.banner_url, p.last_seen, p.is_online,
+                   (SELECT COUNT(*) FROM last_games lg WHERE lg.user_id = u.id) as games_count
+            FROM users u
+            LEFT JOIN user_profiles p ON p.user_id = u.id
+            WHERE u.active = 1
+            ORDER BY p.is_online DESC, p.last_seen DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════
 # СИНХРОНИЗАЦИЯ С TELEGRAM-БОТОМ
 # ══════════════════════════════════════════════════════════════════
 
@@ -642,10 +759,7 @@ async def _notify_tg(tg_uid: int, text: str):
 # ══════════════════════════════════════════════════════════════════
 
 # Раздаём загруженные аватары
-# Раздаём загруженные аватары
-upload_base = Path(DB_DIR) / "uploads"
-upload_base.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(upload_base)), name="uploads")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Раздаём сам сайт (index.html и все .js/.css)
 # Папку "site" создай рядом с api.py и положи туда все файлы сайта
