@@ -1,9 +1,15 @@
 import sqlite3
 import bcrypt
 import uuid
+import os
 from datetime import datetime
 
-DB_PATH = "thepass.db"
+# Если папка /app/data существует (мы на Railway с Volume), сохраняем туда.
+DB_DIR = "/app/data" if os.path.exists("/app/data") else "."
+if os.path.exists("/app"):
+    os.makedirs(DB_DIR, exist_ok=True)
+    
+DB_PATH = os.path.join(DB_DIR, "thepass.db")
 
 # ── Настройки первого админа ─────────────────
 LOGIN    = "admin"
@@ -48,23 +54,5 @@ else:
     """, (uid, LOGIN, pwd, USERNAME, 'admin', 999, datetime.utcnow().isoformat(), 0, 1, ''))
     conn.commit()
     print(f"✅ Админ создан!")
-    print(f"   Логин:  {LOGIN}")
-    print(f"   Пароль: {PASSWORD}")
 
 conn.close()
-```
-
----
-
-### Затем измени `Procfile` чтобы он сначала создал админа
-```
-web: python create_admin.py && uvicorn api:app --host 0.0.0.0 --port $PORT
-```
-
----
-
-### После проверки
-
-Как только войдёшь в аккаунт на сайте — **верни `Procfile` обратно**:
-```
-web: uvicorn api:app --host 0.0.0.0 --port $PORT
