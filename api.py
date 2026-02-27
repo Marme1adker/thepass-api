@@ -40,8 +40,10 @@ JWT_SECRET    = os.getenv("JWT_SECRET", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_H  = 24 * 7   # 7 дней
 
-DB_PATH       = "thepass.db"
-UPLOAD_DIR    = Path("uploads/avatars")
+DB_DIR        = "/app/data" if os.path.exists("/app/data") else "."
+DB_PATH       = os.path.join(DB_DIR, "thepass.db")
+
+UPLOAD_DIR    = Path(DB_DIR) / "uploads" / "avatars"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_AVATAR_MB = 5
