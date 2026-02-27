@@ -20,10 +20,11 @@ USERNAME = "Admin"
 conn = sqlite3.connect(DB_PATH)
 conn.execute("PRAGMA journal_mode=WAL")
 
-# Создаем СРАЗУ ВСЕ необходимые таблицы
+# 1. Создаем таблицы (теперь с num_id)
 conn.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id            TEXT PRIMARY KEY,
+        num_id        INTEGER UNIQUE,
         login         TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         username      TEXT,
@@ -56,19 +57,34 @@ conn.executescript("""
     );
 """)
 
-# Проверяем, существует ли админ
+# 2. УМНЫЙ ПАТЧ: Если таблица старая и в ней нет num_id — добавляем и нумеруем юзеров
+try:
+    conn.execute("ALTER TABLE users ADD COLUMN num_id INTEGER")
+    users = conn.execute("SELECT id FROM users ORDER BY created_at").fetchall()
+    for i, u in enumerate(users, 1):
+        conn.execute("UPDATE users SET num_id=? WHERE id=?", (i, u[0]))
+    conn.commit()
+    print("✅ База обновлена: всем старым аккаунтам выданы короткие ID.")
+except sqlite3.OperationalError:
+    pass # Колонка уже существует, всё ок
+
+# 3. Проверка админа
 existing = conn.execute("SELECT id FROM users WHERE login=?", (LOGIN,)).fetchone()
 if existing:
     print(f"⚠️ Пользователь '{LOGIN}' уже существует.")
 else:
     uid = str(uuid.uuid4())
     pwd = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt()).decode()
+    
+    max_id = conn.execute("SELECT MAX(num_id) FROM users").fetchone()[0] or 0
+    new_num_id = max_id + 1
+    
     conn.execute("""
         INSERT INTO users
-          (id, login, password_hash, username, role, credits, created_at, changed_password, active, note)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-    """, (uid, LOGIN, pwd, USERNAME, 'admin', 999, datetime.utcnow().isoformat(), 0, 1, ''))
+          (id, num_id, login, password_hash, username, role, credits, created_at, changed_password, active, note)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (uid, new_num_id, LOGIN, pwd, USERNAME, 'admin', 999, datetime.utcnow().isoformat(), 0, 1, ''))
     conn.commit()
-    print(f"✅ База данных инициализирована. Админ создан!")
+    print(f"✅ Админ создан! Твой ID: #{new_num_id}")
 
 conn.close()
