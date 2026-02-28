@@ -444,7 +444,36 @@ async def upload_avatar(
 
     return {"avatar_url": avatar_url}
 
+@app.post("/api/auth/banner")
+async def upload_banner(
+    file: UploadFile = File(...),
+    user=Depends(require_user)
+):
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        raise HTTPException(400, "Только JPEG, PNG, WebP или GIF")
 
+    contents = await file.read()
+    if len(contents) > 8 * 1024 * 1024:
+        raise HTTPException(400, "Максимум 8 МБ")
+
+    # Папка для баннеров
+    banner_dir = Path(DB_DIR) / "uploads" / "banners"
+    banner_dir.mkdir(parents=True, exist_ok=True)
+
+    ext      = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "jpg"
+    filename = f"{user['id']}.{ext}"
+    path     = banner_dir / filename
+
+    async with aiofiles.open(path, "wb") as f:
+        await f.write(contents)
+
+    banner_url = f"/uploads/banners/{filename}"
+
+    with get_db() as db:
+        db.execute("UPDATE users SET banner_url=? WHERE id=?", (banner_url, user["id"]))
+        log_action(db, user["id"], "upload_banner")
+
+    return {"banner_url": banner_url}
 # ══════════════════════════════════════════════════════════════════
 # ЭНДПОИНТЫ — АККАУНТЫ (только для вебхуков от бота)
 # ══════════════════════════════════════════════════════════════════
