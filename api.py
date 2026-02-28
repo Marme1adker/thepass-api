@@ -688,6 +688,49 @@ async def admin_reset_password(user_id: str, admin=Depends(require_admin)):
     return {"ok": True, "password": new_pwd}
 
 
+# ── Списание 1 кредита при поиске игры (вызывается с фронта) ─────
+@app.post("/api/auth/spend-credit")
+async def spend_credit(user=Depends(require_user)):
+    """
+    Тратит 1 кредит (activation) при нажатии кнопки «Найти игру».
+    Доступен любому залогиненному пользователю с credits > 0.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT credits FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not row or row["credits"] <= 0:
+            raise HTTPException(400, "Нет доступных активаций")
+        db.execute(
+            "UPDATE users SET credits = credits - 1 WHERE id=? AND credits > 0",
+            (user["id"],)
+        )
+        updated = db.execute("SELECT credits FROM users WHERE id=?", (user["id"],)).fetchone()
+        log_action(db, user["id"], "spend_credit", detail=f"remaining={updated['credits']}")
+    return {"ok": True, "credits": updated["credits"]}
+
+
+# ── Сброс подписки пользователя (только admin) ─────────────────────
+@app.post("/api/admin/users/{user_id}/reset-sub")
+async def admin_reset_sub(user_id: str, admin=Depends(require_admin)):
+    """Убирает подписку: sub_until=NULL, role='user'."""
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Пользователь не найден")
+        db.execute(
+            "UPDATE users SET sub_until=NULL, role='user' WHERE id=?",
+            (user_id,)
+        )
+        log_action(db, admin["id"], "reset_sub", detail=user_id)
+
+    if row["tg_uid"]:
+        asyncio.create_task(_notify_tg(
+            row["tg_uid"],
+            "ℹ️ Ваша подписка The Pass была сброшена администратором."
+        ))
+
+    return {"ok": True}
+
+
 @app.get("/api/admin/logs")
 async def admin_logs(limit: int = 100, admin=Depends(require_admin)):
     with get_db() as db:
