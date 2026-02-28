@@ -118,7 +118,7 @@ def init_db():
             pass
         try:
             db.execute("ALTER TABLE users ADD COLUMN banner_url TEXT")
-            except Exception:
+        except Exception:
             pass
     print("✅ БД инициализирована:", DB_PATH)
 
