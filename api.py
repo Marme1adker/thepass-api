@@ -493,7 +493,6 @@ async def bot_sync_user(request: Request):
 @app.get("/api/community/users")
 async def get_community_users():
     with get_db() as db:
-        # Получаем всех активных пользователей, сортируем по UID (кто раньше зарегался)
         rows = db.execute("SELECT num_id, login, username, role, avatar_url, created_at FROM users WHERE active=1 ORDER BY num_id ASC").fetchall()
     
     users = []
@@ -507,7 +506,6 @@ async def get_community_users():
             "created_at": r["created_at"]
         })
     return users
-
 # ══════════════════════════════════════════════════════════════════
 # ЭНДПОИНТЫ — ADMIN
 # ══════════════════════════════════════════════════════════════════
