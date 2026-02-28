@@ -85,6 +85,7 @@ def init_db():
                 role         TEXT NOT NULL DEFAULT 'user',
                 sub_until    TEXT,
                 avatar_url   TEXT,
+                banner_url   TEXT,
                 credits      INTEGER NOT NULL DEFAULT 0,
                 tg_uid       INTEGER,
                 created_at   TEXT NOT NULL,
@@ -114,6 +115,10 @@ def init_db():
             for i, u in enumerate(users, 1):
                 db.execute("UPDATE users SET num_id=? WHERE id=?", (i, u[0]))
         except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN banner_url TEXT")
+            except Exception:
             pass
     print("✅ БД инициализирована:", DB_PATH)
 
