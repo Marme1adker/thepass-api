@@ -527,17 +527,23 @@ async def bot_sync_user(request: Request):
 @app.get("/api/community/users")
 async def get_community_users():
     with get_db() as db:
-        rows = db.execute("SELECT num_id, login, username, role, avatar_url, created_at FROM users WHERE active=1 ORDER BY num_id ASC").fetchall()
+        rows = db.execute(
+            "SELECT num_id, login, username, role, avatar_url, banner_url, credits, sub_until, created_at "
+            "FROM users WHERE active=1 ORDER BY num_id ASC"
+        ).fetchall()
     
     users = []
     for r in rows:
         users.append({
-            "num_id": r["num_id"],
-            "login": r["login"],
-            "username": r["username"],
-            "role": r["role"],
+            "num_id":     r["num_id"],
+            "login":      r["login"],
+            "username":   r["username"],
+            "role":       r["role"],
             "avatar_url": r["avatar_url"],
-            "created_at": r["created_at"]
+            "banner_url": r["banner_url"],
+            "credits":    r["credits"] or 0,
+            "sub_until":  r["sub_until"],
+            "created_at": r["created_at"],
         })
     return users
 # ══════════════════════════════════════════════════════════════════
