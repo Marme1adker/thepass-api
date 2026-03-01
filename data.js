@@ -553,6 +553,9 @@ const _localGames = [
 
   
     { title: 'Atomic Heart - Premium Edition',  short: 'Atomic Heart',  group: 'Mundfish',  img: steamImg(668580),  hasDlc: true, tags: ['Экшены', 'Приключенческие игры', 'Ролевые игры'],  opts: ['dlc', 'ru'],  source: 'steam', },
+
+    // ── Добавлено через админку ───────────────────────────────────
+    { title: 'Kena: Bridge of Spirits', short: 'Kena', group: 'Инди • Разное', img: steamImg(1954200), tags: ['Экшн', 'Приключение', 'Сюжет'], opts: [], source: 'local' },
 ];
 
 // ── API URL — подставь свой Railway URL ─────────────────────────
