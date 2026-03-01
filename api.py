@@ -920,6 +920,122 @@ async def _notify_tg(tg_uid: int, text: str):
 
 
 # ══════════════════════════════════════════════════════════════════
+# ADMIN — Добавление игры в каталог (data.js)
+# ══════════════════════════════════════════════════════════════════
+
+class AdminAddGameRequest(BaseModel):
+    title:        str
+    short:        str          = ""
+    group:        str          = "Инди • Разное"
+    hasDlc:       bool         = False
+    source:       str          = "local"   # local | steam
+    marme1adker:  bool         = False
+    steamId:      int
+    steampassUrl: str | None   = None
+    tags:         list[str]    = []
+    opts:         list[str]    = []        # dlc, ru, online
+
+
+@app.post("/api/admin/games/add")
+async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)):
+    """
+    Добавляет новую игру в data.js сайта.
+    Файл data.js должен лежать в папке site/ рядом с api.py.
+    Вставляет запись в конец массива, прямо перед закрывающей `];`.
+    """
+    import re
+
+    site_dir  = Path("site")
+    data_file = site_dir / "data.js"
+
+    if not data_file.exists():
+        raise HTTPException(404, "data.js не найден в папке site/")
+
+    # Формируем JS-объект новой игры
+    def js_str(s: str) -> str:
+        return "'" + s.replace("\", "\\").replace("'", "\'") + "'"
+
+    def js_bool(b: bool) -> str:
+        return "true" if b else "false"
+
+    def js_arr(items: list) -> str:
+        return "[" + ", ".join(js_str(i) for i in items) + "]"
+
+    parts = []
+    parts.append(f"title: {js_str(body.title)}")
+    if body.short:
+        parts.append(f"short: {js_str(body.short)}")
+    parts.append(f"group: {js_str(body.group)}")
+    parts.append(f"img: steamImg({body.steamId})")
+    if body.hasDlc:
+        parts.append("hasDlc: true")
+    if body.tags:
+        parts.append(f"tags: {js_arr(body.tags)}")
+    if body.opts:
+        parts.append(f"opts: {js_arr(body.opts)}")
+    else:
+        parts.append("opts: []")
+    parts.append(f"source: {js_str(body.source)}")
+    if body.marme1adker:
+        parts.append("marme1adker: true")
+    if body.steampassUrl:
+        parts.append(f"steampassUrl: {js_str(body.steampassUrl)}")
+
+    indent = "    "
+    fields = (",\n" + indent + indent).join(parts)
+    new_entry = f"\n    {{ {fields} }},"
+
+    async with aiofiles.open(str(data_file), "r", encoding="utf-8") as f:
+        content_js = await f.read()
+
+    # Проверяем дублирование по title
+    if body.title.replace("'", "\'") in content_js or body.title in content_js:
+        raise HTTPException(409, f"Игра «{body.title}» уже есть в каталоге")
+
+    # Ищем закрывающую строку ];  в конце массива и вставляем перед ней.
+    # data.js заканчивается: ..., }\n];\n}
+    # Используем re.sub чтобы вставить перед ПОСЛЕДНИМ `];`
+    import re as _re
+    pattern = r'(\n\s*\];)'
+    matches = list(_re.finditer(pattern, content_js))
+    if not matches:
+        raise HTTPException(500, "Не удалось найти конец массива в data.js")
+    # Берём последний `];`
+    last_match = matches[-1]
+    new_content = (
+        content_js[:last_match.start()] +
+        new_entry +
+        last_match.group(0) +
+        content_js[last_match.end():]
+    )
+
+    async with aiofiles.open(str(data_file), "w", encoding="utf-8") as f:
+        await f.write(new_content)
+
+    log_action(
+        get_db(),
+        admin["id"],
+        "add_game",
+        detail=f"title={body.title}, steamId={body.steamId}, source={body.source}"
+    )
+
+    return {
+        "ok": True,
+        "message": f"Игра «{body.title}» успешно добавлена в каталог",
+        "game": {
+            "title":       body.title,
+            "short":       body.short,
+            "group":       body.group,
+            "steamId":     body.steamId,
+            "source":      body.source,
+            "marme1adker": body.marme1adker,
+            "hasDlc":      body.hasDlc,
+        }
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════
 # СТАТИЧЕСКИЕ ФАЙЛЫ
 # ══════════════════════════════════════════════════════════════════
 
