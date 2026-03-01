@@ -975,20 +975,28 @@ def _init_guard_table():
     with get_db() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS guard_jobs (
-                id         TEXT PRIMARY KEY,
-                login      TEXT NOT NULL,
-                game_title TEXT,
-                user_id    TEXT,
-                status     TEXT NOT NULL DEFAULT 'pending',
-                guard_code TEXT,
-                expires_in INTEGER,
-                error      TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                id             TEXT PRIMARY KEY,
+                login          TEXT NOT NULL,
+                game_title     TEXT,
+                user_id        TEXT,
+                search_job_id  TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                guard_code     TEXT,
+                expires_in     INTEGER,
+                error          TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
             )
         """)
 
 _init_guard_table()
+
+# Миграция: добавляем search_job_id если его нет (для старых БД)
+try:
+    with get_db() as _db:
+        _db.execute("ALTER TABLE guard_jobs ADD COLUMN search_job_id TEXT")
+except Exception:
+    pass  # Колонка уже существует
 
 
 # ── Модели ────────────────────────────────────────────────────────
@@ -1020,9 +1028,9 @@ async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
     guard_job_id = gen_id()
     with get_db() as db:
         db.execute(
-            "INSERT INTO guard_jobs (id, login, game_title, user_id, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-            (guard_job_id, login, body.game_title or "", user["id"], now, now)
+            "INSERT INTO guard_jobs (id, login, game_title, user_id, search_job_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (guard_job_id, login, body.game_title or "", user["id"], body.job_id or None, now, now)
         )
         log_action(db, user["id"], "guard_request", detail=f"login={login}, job={guard_job_id}")
 
@@ -1114,3 +1122,84 @@ async def bot_guard_result(guard_job_id: str, request: Request):
             )
 
     return {"ok": True}
+
+
+# ── 5. Бот ищет guard-задачу по search_job_id ────────────────────
+# Вызывается из catalog_worker каждую секунду пока ждёт Guard.
+
+@app.get("/api/bot/guard-jobs/for-search/{search_job_id}")
+async def bot_guard_for_search(search_job_id: str, request: Request):
+    """
+    Бот проверяет: нажал ли пользователь Guard-кнопку для конкретного поиска.
+    Возвращает guard-job если он есть и ещё не взят, иначе {"job": null}.
+    """
+    _require_bot(request)
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM guard_jobs WHERE search_job_id=? AND status='pending' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (search_job_id,)
+        ).fetchone()
+        if not row:
+            return {"job": None}
+        # Помечаем как "processing" — бот взял
+        db.execute(
+            "UPDATE guard_jobs SET status='processing', updated_at=? WHERE id=?",
+            (now, row["id"])
+        )
+    return {"job": {"id": row["id"], "login": row["login"], "game_title": row["game_title"]}}
+
+
+# ── 6. Бот пропускает guard-задачу (не локальный аккаунт) ────────
+
+@app.post("/api/bot/guard-jobs/{guard_job_id}/skip")
+async def bot_guard_skip(guard_job_id: str, request: Request):
+    """
+    Возвращает guard-job в статус pending — чтобы его взял другой обработчик.
+    Используется _guard_tick когда логин не входит в _LOCAL_GUARD_LOGINS.
+    """
+    _require_bot(request)
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute(
+            "UPDATE guard_jobs SET status='pending', updated_at=? WHERE id=?",
+            (now, guard_job_id)
+        )
+    return {"ok": True}
+
+
+# ── 7. Бот обновляет Guard в результате поиска ───────────────────
+# Вызывается после click_guard_on_page — пишет код в search_jobs.result.
+
+@app.patch("/api/bot/search-jobs/{job_id}/guard")
+async def bot_update_guard(job_id: str, request: Request):
+    """
+    Обновляет поле guard в уже опубликованном результате поиска.
+    Сайт при следующем поллинге (или SSE) увидит актуальный код.
+    """
+    _require_bot(request)
+    body       = await request.json()
+    guard_code = body.get("guard", "—")
+    now        = datetime.utcnow().isoformat()
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT result FROM search_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Задача поиска не найдена")
+
+        # Обновляем guard в JSON-результате
+        try:
+            result = _json.loads(row["result"]) if row["result"] else {}
+        except Exception:
+            result = {}
+        result["guard"] = guard_code
+
+        db.execute(
+            "UPDATE search_jobs SET result=?, updated_at=? WHERE id=?",
+            (_json.dumps(result, ensure_ascii=False), now, job_id)
+        )
+
+    return {"ok": True, "guard": guard_code}
