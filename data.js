@@ -2,7 +2,7 @@
  * data.js — источник данных каталога
  *
  * Игры хранятся в БД на Railway API.
- * Этот файл просто запрашивает их оттуда.
+ * fetchGames() запрашивает их через GET /api/games.
  *
  * source: 'local' | 'steam'
  *   local = мгновенно из локальной базы (⚡)
@@ -12,13 +12,18 @@
 const steamImg = id =>
   `https://cdn.cloudflare.steamstatic.com/steam/apps/${id}/header.jpg`;
 
-const _API_BASE = (typeof AUTH_CONFIG !== 'undefined' && AUTH_CONFIG.BASE_URL)
-  ? AUTH_CONFIG.BASE_URL
-  : 'https://thepass-api.up.railway.app';
-
 async function fetchGames() {
+  // Берём URL из auth_config.js (THEPASS_API_URL) или AUTH_CONFIG.BASE_URL
+  // data.js грузится раньше auth_config.js, поэтому читаем в момент вызова
+  const apiBase =
+    (typeof THEPASS_API_URL !== 'undefined' && THEPASS_API_URL)
+      ? THEPASS_API_URL
+      : (typeof AUTH_CONFIG !== 'undefined' && AUTH_CONFIG.BASE_URL)
+        ? AUTH_CONFIG.BASE_URL
+        : 'https://thepass-api.up.railway.app';
+
   try {
-    const res = await fetch(`${_API_BASE}/api/games`);
+    const res = await fetch(`${apiBase}/api/games`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const games = await res.json();
     return games.map(g => ({
