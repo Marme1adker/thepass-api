@@ -1027,7 +1027,8 @@ async def admin_seed_games(request: Request, admin=Depends(require_admin)):
     return {"ok": True, "added": added, "skipped": skipped}
 
 
-(body: AdminAddGameRequest, admin=Depends(require_admin)):
+@app.post("/api/admin/games/add")
+async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)):
     """
     Добавляет новую игру в таблицу games (SQLite).
     Фронт читает игры через GET /api/games.
