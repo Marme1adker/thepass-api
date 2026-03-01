@@ -955,3 +955,162 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", 8000)),
         reload=False,
     )
+
+
+# ══════════════════════════════════════════════════════════════════
+# GUARD-ОЧЕРЕДЬ — сайт запрашивает, бот генерирует код
+# ══════════════════════════════════════════════════════════════════
+#
+# Поток:
+#  1. Сайт  → POST /api/search/guard          → получает guard_job_id
+#  2. Сайт  → GET  /api/search/guard/{id}     → опрашивает каждые 2 сек
+#  3. Бот   → GET  /api/bot/guard-jobs/next   → забирает задачу
+#  4. Бот   → POST /api/bot/guard-jobs/{id}/result → пишет код
+#  5. Сайт  → GET  /api/search/guard/{id}     → видит status=done, забирает код
+#
+# Хранится в SQLite (таблица guard_jobs), не in-memory — Railway не теряет при рестарте.
+
+# ── Создаём таблицу при старте ────────────────────────────────────
+def _init_guard_table():
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS guard_jobs (
+                id         TEXT PRIMARY KEY,
+                login      TEXT NOT NULL,
+                game_title TEXT,
+                user_id    TEXT,
+                status     TEXT NOT NULL DEFAULT 'pending',
+                guard_code TEXT,
+                expires_in INTEGER,
+                error      TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+_init_guard_table()
+
+
+# ── Модели ────────────────────────────────────────────────────────
+
+class GuardStartRequest(BaseModel):
+    login:      str
+    game_title: Optional[str] = ""
+    job_id:     Optional[str] = None   # job_id основного поиска (для контекста)
+
+
+# ── 1. Сайт создаёт guard-задачу ─────────────────────────────────
+
+@app.post("/api/search/guard")
+async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
+    """Сайт вызывает когда пользователь нажимает «Получить Guard-код»."""
+    login = body.login.strip()
+    if not login:
+        raise HTTPException(400, "login обязателен")
+
+    # Удаляем старые задачи этого пользователя (чтобы не копились)
+    now = datetime.utcnow().isoformat()
+    cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    with get_db() as db:
+        db.execute(
+            "DELETE FROM guard_jobs WHERE user_id=? AND created_at<?",
+            (user["id"], cutoff)
+        )
+
+    guard_job_id = gen_id()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO guard_jobs (id, login, game_title, user_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (guard_job_id, login, body.game_title or "", user["id"], now, now)
+        )
+        log_action(db, user["id"], "guard_request", detail=f"login={login}, job={guard_job_id}")
+
+    return {"guard_job_id": guard_job_id}
+
+
+# ── 2. Сайт опрашивает статус ─────────────────────────────────────
+
+@app.get("/api/search/guard/{guard_job_id}")
+async def guard_status(guard_job_id: str, user=Depends(require_user)):
+    """Сайт опрашивает каждые 2 сек до получения кода."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM guard_jobs WHERE id=? AND user_id=?",
+            (guard_job_id, user["id"])
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Guard задача не найдена")
+
+    row = dict(row)
+
+    # Таймаут 3 мин — возвращаем ошибку
+    created = datetime.fromisoformat(row["created_at"])
+    if (datetime.utcnow() - created).total_seconds() > 180:
+        return {"status": "error", "error": "Таймаут (бот не ответил за 3 минуты)"}
+
+    if row["status"] == "done":
+        return {
+            "status":     "done",
+            "guard":      row["guard_code"],
+            "expires_in": row["expires_in"] or 30,
+        }
+    elif row["status"] == "error":
+        return {"status": "error", "error": row["error"] or "Неизвестная ошибка"}
+    else:
+        return {"status": "pending"}
+
+
+# ── 3. Бот забирает следующую guard-задачу ────────────────────────
+
+@app.get("/api/bot/guard-jobs/next")
+async def bot_guard_next(request: Request):
+    """Бот вызывает каждые 2 сек — забирает pending задачу."""
+    _require_bot(request)
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM guard_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {"job": None}
+        # Помечаем как "processing" — бот взял
+        db.execute(
+            "UPDATE guard_jobs SET status='processing', updated_at=? WHERE id=?",
+            (now, row["id"])
+        )
+    return {"job": {"id": row["id"], "login": row["login"], "game_title": row["game_title"]}}
+
+
+# ── 4. Бот записывает результат ───────────────────────────────────
+
+@app.post("/api/bot/guard-jobs/{guard_job_id}/result")
+async def bot_guard_result(guard_job_id: str, request: Request):
+    """Бот пишет сгенерированный код (или ошибку)."""
+    _require_bot(request)
+    body       = await request.json()
+    guard_code = body.get("guard")
+    expires_in = body.get("expires_in", 30)
+    error      = body.get("error")
+    now        = datetime.utcnow().isoformat()
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id FROM guard_jobs WHERE id=?", (guard_job_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Guard задача не найдена")
+
+        if error:
+            db.execute(
+                "UPDATE guard_jobs SET status='error', error=?, updated_at=? WHERE id=?",
+                (error, now, guard_job_id)
+            )
+        else:
+            db.execute(
+                "UPDATE guard_jobs SET status='done', guard_code=?, expires_in=?, updated_at=? WHERE id=?",
+                (guard_code, expires_in, now, guard_job_id)
+            )
+
+    return {"ok": True}
