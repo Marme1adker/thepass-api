@@ -1030,10 +1030,10 @@ async def admin_seed_games(request: Request, admin=Depends(require_admin)):
 @app.post("/api/admin/games/add")
 async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)):
     """
-    Добавляет новую игру в таблицу games (SQLite).
-    Фронт читает игры через GET /api/games.
+    Добавляет новую игру в таблицу games (SQLite) и в data.js (site/).
     """
     import json as _j
+    import re as _re
 
     now = datetime.utcnow().isoformat()
 
@@ -1061,6 +1061,47 @@ async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)
         ))
         log_action(db, admin["id"], "add_game",
                    detail=f"title={body.title}, steamId={body.steamId}, source={body.source}")
+
+    # ── Также пишем в data.js чтобы сайт сразу видел игру ────────
+    data_js_path = Path("site") / "data.js"
+    if not data_js_path.exists():
+        data_js_path = Path("data.js")  # fallback — рядом с api.py
+
+    if data_js_path.exists():
+        def js_str(s: str) -> str:
+            return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        def js_arr(items: list) -> str:
+            return "[" + ", ".join(js_str(i) for i in items) + "]"
+
+        parts = [f"title: {js_str(body.title)}"]
+        if body.short:
+            parts.append(f"short: {js_str(body.short)}")
+        parts.append(f"group: {js_str(body.group)}")
+        parts.append(f"img: steamImg({body.steamId})")
+        if body.hasDlc:
+            parts.append("hasDlc: true")
+        if body.tags:
+            parts.append(f"tags: {js_arr(body.tags)}")
+        parts.append(f"opts: {js_arr(body.opts)}")
+        parts.append(f"source: {js_str(body.source)}")
+        if body.marme1adker:
+            parts.append("marme1adker: true")
+        if body.steampassUrl:
+            parts.append(f"steampassUrl: {js_str(body.steampassUrl)}")
+
+        fields = ", ".join(parts)
+        new_entry = f"\n    {{ {fields} }},"
+
+        async with aiofiles.open(str(data_js_path), "r", encoding="utf-8") as f:
+            content = await f.read()
+
+        # Вставляем перед закрывающим ];  массива _localGames или основного массива
+        matches = list(_re.finditer(r'(\n\s*\];)', content))
+        if matches:
+            last = matches[-1]
+            content = content[:last.start()] + new_entry + last.group(0) + content[last.end():]
+            async with aiofiles.open(str(data_js_path), "w", encoding="utf-8") as f:
+                await f.write(content)
 
     return {
         "ok": True,
