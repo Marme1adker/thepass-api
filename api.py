@@ -120,6 +120,20 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN banner_url TEXT")
         except Exception:
             pass
+        # ── Очередь поиска из каталога ──────────────────────────
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS search_jobs (
+                id         TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                tg_uid     INTEGER,
+                query      TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'pending',
+                result     TEXT,
+                error      TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
     print("✅ БД инициализирована:", DB_PATH)
 
 
@@ -738,6 +752,150 @@ async def admin_logs(limit: int = 100, admin=Depends(require_admin)):
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════
+# ПОИСК ИЗ КАТАЛОГА — без sendData, через очередь
+# ══════════════════════════════════════════════════════════════════
+
+import json as _json
+
+class SearchStartRequest(BaseModel):
+    game_title: str
+
+
+@app.post("/api/search/start")
+async def search_start(body: SearchStartRequest, user=Depends(require_user)):
+    """
+    Сайт вызывает этот эндпоинт когда пользователь нажимает «Найти».
+    Создаёт задачу в очереди, возвращает job_id.
+    Бот периодически забирает задачи и выполняет поиск.
+    """
+    title = body.game_title.strip()
+    if not title:
+        raise HTTPException(400, "game_title обязателен")
+
+    # Проверяем доступ: подписка или кредиты
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE id=? AND active=1", (user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(403, "Пользователь не найден")
+
+        has_sub = bool(row["sub_until"] and row["sub_until"] > datetime.utcnow().isoformat())
+        is_admin = row["role"] in ("admin", "premium")
+        has_access = has_sub or is_admin
+        credits_remaining = row["credits"]  # текущий баланс
+
+        if not has_access:
+            if row["credits"] <= 0:
+                raise HTTPException(402, "Нет активаций. Пополните баланс или купите подписку.")
+            # Списываем кредит сразу при постановке в очередь
+            db.execute(
+                "UPDATE users SET credits = credits - 1 WHERE id=? AND credits > 0",
+                (user["id"],)
+            )
+            updated = db.execute("SELECT credits FROM users WHERE id=?", (user["id"],)).fetchone()
+            credits_remaining = updated["credits"]
+            log_action(db, user["id"], "spend_credit_catalog", detail=f"query={title}, remaining={credits_remaining}")
+
+        # Создаём задачу
+        now    = datetime.utcnow().isoformat()
+        job_id = gen_id()
+        tg_uid = row["tg_uid"]
+
+        db.execute(
+            "INSERT INTO search_jobs (id, user_id, tg_uid, query, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (job_id, user["id"], tg_uid, title, now, now)
+        )
+        log_action(db, user["id"], "catalog_search_start", detail=f"job={job_id}, query={title}")
+
+    return {
+        "ok":      True,
+        "job_id":  job_id,
+        "credits": credits_remaining,
+    }
+
+
+@app.get("/api/search/status/{job_id}")
+async def search_status(job_id: str, user=Depends(require_user)):
+    """Сайт опрашивает этот эндпоинт каждые 2–3 сек чтобы узнать результат."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM search_jobs WHERE id=? AND user_id=?",
+            (job_id, user["id"])
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Задача не найдена")
+
+    result = None
+    if row["result"]:
+        try:
+            result = _json.loads(row["result"])
+        except Exception:
+            result = {"raw": row["result"]}
+
+    return {
+        "job_id": job_id,
+        "status": row["status"],   # pending | searching | done | not_found | error
+        "result": result,
+        "error":  row["error"],
+    }
+
+
+# ── Эндпоинты для БОТА — забрать задачу и записать результат ────
+
+BOT_SECRET_KEY = os.getenv("BOT_SECRET", "changeme")
+
+
+def _require_bot(request: Request):
+    secret = request.headers.get("X-Bot-Secret", "")
+    if secret != BOT_SECRET_KEY:
+        raise HTTPException(403, "Forbidden")
+
+
+@app.get("/api/bot/search-jobs/next")
+async def bot_get_next_job(request: Request):
+    """Бот вызывает каждые 3 сек — забирает следующую pending задачу."""
+    _require_bot(request)
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM search_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {"job": None}
+        # Помечаем как "searching" чтобы не взяли дважды
+        db.execute(
+            "UPDATE search_jobs SET status='searching', updated_at=? WHERE id=?",
+            (now, row["id"])
+        )
+    return {"job": dict(row)}
+
+
+@app.post("/api/bot/search-jobs/{job_id}/result")
+async def bot_set_result(job_id: str, request: Request):
+    """Бот записывает результат поиска."""
+    _require_bot(request)
+    body   = await request.json()
+    status = body.get("status", "done")   # done | not_found | error
+    result = body.get("result")           # dict с login/pass/guard/game
+    error  = body.get("error", "")
+    now    = datetime.utcnow().isoformat()
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE search_jobs SET status=?, result=?, error=?, updated_at=? WHERE id=?",
+            (
+                status,
+                _json.dumps(result, ensure_ascii=False) if result else None,
+                error,
+                now,
+                job_id,
+            )
+        )
+    return {"ok": True}
 
 
 # ══════════════════════════════════════════════════════════════════
