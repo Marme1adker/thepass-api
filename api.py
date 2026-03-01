@@ -953,7 +953,7 @@ async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)
 
     # Формируем JS-объект новой игры
     def js_str(s: str) -> str:
-        return "'" + s.replace("\", "\\").replace("'", "\'") + "'"
+        return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
     def js_bool(b: bool) -> str:
         return "true" if b else "false"
