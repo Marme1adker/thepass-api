@@ -9,8 +9,8 @@
 const steamImg = id =>
   `https://cdn.cloudflare.steamstatic.com/steam/apps/${id}/header.jpg`;
 
-async function fetchGames() {
-  return [
+// ── Локальный fallback — используется если API недоступен ────────
+const _localGames = [
 
     // ── Rockstar ─────────────────────────────────────────────────
     { title: 'Grand Theft Auto V',                    short: 'GTA V',              group: 'Rockstar',            img: steamImg(271590),   hasDlc: true,  tags: ['Открытый мир', 'Шутер', 'Экшн', 'Кооп'],          opts: ['dlc', 'online'],  source: 'steam' },
@@ -554,4 +554,24 @@ async function fetchGames() {
   
     { title: 'Atomic Heart - Premium Edition',  short: 'Atomic Heart',  group: 'Mundfish',  img: steamImg(668580),  hasDlc: true, tags: ['Экшены', 'Приключенческие игры', 'Ролевые игры'],  opts: ['dlc', 'ru'],  source: 'steam', },
 ];
+
+// ── API URL — подставь свой Railway URL ─────────────────────────
+const API_BASE = typeof window !== 'undefined'
+  ? (window.API_BASE || '')
+  : '';
+
+async function fetchGames() {
+  try {
+    const res = await fetch(`${API_BASE}/api/games`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const games = await res.json();
+    // API возвращает steamId, но нам нужен img
+    return games.map(g => ({
+      ...g,
+      img: steamImg(g.steamId),
+    }));
+  } catch (e) {
+    console.warn('[fetchGames] API недоступен, использую локальный fallback:', e);
+    return _localGames;
+  }
 }

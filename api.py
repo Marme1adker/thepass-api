@@ -120,6 +120,23 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN banner_url TEXT")
         except Exception:
             pass
+        # ── Каталог игр ──────────────────────────────────────────
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS games (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                title        TEXT NOT NULL UNIQUE,
+                short        TEXT NOT NULL DEFAULT '',
+                grp          TEXT NOT NULL DEFAULT 'Инди • Разное',
+                steam_id     INTEGER NOT NULL DEFAULT 0,
+                has_dlc      INTEGER NOT NULL DEFAULT 0,
+                source       TEXT NOT NULL DEFAULT 'local',
+                marme1adker  INTEGER NOT NULL DEFAULT 0,
+                steampass_url TEXT,
+                tags         TEXT NOT NULL DEFAULT '[]',
+                opts         TEXT NOT NULL DEFAULT '[]',
+                created_at   TEXT NOT NULL
+            )
+        """)
         # ── Очередь поиска из каталога ──────────────────────────
         db.execute("""
             CREATE TABLE IF NOT EXISTS search_jobs (
@@ -920,6 +937,33 @@ async def _notify_tg(tg_uid: int, text: str):
 
 
 # ══════════════════════════════════════════════════════════════════
+# КАТАЛОГ ИГР — публичный список из БД
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/games")
+async def get_games():
+    """Возвращает весь список игр из БД. Вызывается фронтом вместо data.js."""
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM games ORDER BY id ASC").fetchall()
+    import json as _j
+    result = []
+    for r in rows:
+        result.append({
+            "title":        r["title"],
+            "short":        r["short"],
+            "group":        r["grp"],
+            "steamId":      r["steam_id"],
+            "hasDlc":       bool(r["has_dlc"]),
+            "source":       r["source"],
+            "marme1adker":  bool(r["marme1adker"]),
+            "steampassUrl": r["steampass_url"],
+            "tags":         _j.loads(r["tags"]) if r["tags"] else [],
+            "opts":         _j.loads(r["opts"]) if r["opts"] else [],
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════
 # ADMIN — Добавление игры в каталог (data.js)
 # ══════════════════════════════════════════════════════════════════
 
@@ -936,88 +980,86 @@ class AdminAddGameRequest(BaseModel):
     opts:         list[str]    = []        # dlc, ru, online
 
 
-@app.post("/api/admin/games/add")
-async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)):
+@app.post("/api/admin/games/seed")
+async def admin_seed_games(request: Request, admin=Depends(require_admin)):
     """
-    Добавляет новую игру в data.js сайта.
-    Файл data.js должен лежать в папке site/ рядом с api.py.
-    Вставляет запись в конец массива, прямо перед закрывающей `];`.
+    Массовая загрузка игр в БД (для первоначального импорта из data.js).
+    Body: { "games": [ { title, short, group, steamId, hasDlc, source,
+                          marme1adker, steampassUrl, tags, opts } ] }
+    Уже существующие игры пропускаются (не перезаписываются).
     """
-    import re
+    import json as _j
+    body = await request.json()
+    games = body.get("games", [])
+    added = 0
+    skipped = 0
+    now = datetime.utcnow().isoformat()
 
-    site_dir  = Path("site")
-    data_file = site_dir / "data.js"
+    with get_db() as db:
+        for g in games:
+            try:
+                db.execute("""
+                    INSERT OR IGNORE INTO games
+                      (title, short, grp, steam_id, has_dlc, source,
+                       marme1adker, steampass_url, tags, opts, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    g.get("title", ""),
+                    g.get("short", ""),
+                    g.get("group", "Инди • Разное"),
+                    g.get("steamId", 0),
+                    1 if g.get("hasDlc") else 0,
+                    g.get("source", "local"),
+                    1 if g.get("marme1adker") else 0,
+                    g.get("steampassUrl"),
+                    _j.dumps(g.get("tags", []), ensure_ascii=False),
+                    _j.dumps(g.get("opts", []), ensure_ascii=False),
+                    now,
+                ))
+                if db.execute("SELECT changes()").fetchone()[0]:
+                    added += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+        log_action(db, admin["id"], "seed_games", detail=f"added={added}, skipped={skipped}")
 
-    if not data_file.exists():
-        raise HTTPException(404, "data.js не найден в папке site/")
+    return {"ok": True, "added": added, "skipped": skipped}
 
-    # Формируем JS-объект новой игры
-    def js_str(s: str) -> str:
-        return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
-    def js_bool(b: bool) -> str:
-        return "true" if b else "false"
+(body: AdminAddGameRequest, admin=Depends(require_admin)):
+    """
+    Добавляет новую игру в таблицу games (SQLite).
+    Фронт читает игры через GET /api/games.
+    """
+    import json as _j
 
-    def js_arr(items: list) -> str:
-        return "[" + ", ".join(js_str(i) for i in items) + "]"
+    now = datetime.utcnow().isoformat()
 
-    parts = []
-    parts.append(f"title: {js_str(body.title)}")
-    if body.short:
-        parts.append(f"short: {js_str(body.short)}")
-    parts.append(f"group: {js_str(body.group)}")
-    parts.append(f"img: steamImg({body.steamId})")
-    if body.hasDlc:
-        parts.append("hasDlc: true")
-    if body.tags:
-        parts.append(f"tags: {js_arr(body.tags)}")
-    if body.opts:
-        parts.append(f"opts: {js_arr(body.opts)}")
-    else:
-        parts.append("opts: []")
-    parts.append(f"source: {js_str(body.source)}")
-    if body.marme1adker:
-        parts.append("marme1adker: true")
-    if body.steampassUrl:
-        parts.append(f"steampassUrl: {js_str(body.steampassUrl)}")
+    with get_db() as db:
+        exists = db.execute("SELECT id FROM games WHERE title=?", (body.title,)).fetchone()
+        if exists:
+            raise HTTPException(409, f"Игра «{body.title}» уже есть в каталоге")
 
-    indent = "    "
-    fields = (",\n" + indent + indent).join(parts)
-    new_entry = f"\n    {{ {fields} }},"
-
-    async with aiofiles.open(str(data_file), "r", encoding="utf-8") as f:
-        content_js = await f.read()
-
-    # Проверяем дублирование по title
-    if body.title.replace("'", "\'") in content_js or body.title in content_js:
-        raise HTTPException(409, f"Игра «{body.title}» уже есть в каталоге")
-
-    # Ищем закрывающую строку ];  в конце массива и вставляем перед ней.
-    # data.js заканчивается: ..., }\n];\n}
-    # Используем re.sub чтобы вставить перед ПОСЛЕДНИМ `];`
-    import re as _re
-    pattern = r'(\n\s*\];)'
-    matches = list(_re.finditer(pattern, content_js))
-    if not matches:
-        raise HTTPException(500, "Не удалось найти конец массива в data.js")
-    # Берём последний `];`
-    last_match = matches[-1]
-    new_content = (
-        content_js[:last_match.start()] +
-        new_entry +
-        last_match.group(0) +
-        content_js[last_match.end():]
-    )
-
-    async with aiofiles.open(str(data_file), "w", encoding="utf-8") as f:
-        await f.write(new_content)
-
-    log_action(
-        get_db(),
-        admin["id"],
-        "add_game",
-        detail=f"title={body.title}, steamId={body.steamId}, source={body.source}"
-    )
+        db.execute("""
+            INSERT INTO games (title, short, grp, steam_id, has_dlc, source,
+                               marme1adker, steampass_url, tags, opts, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            body.title,
+            body.short,
+            body.group,
+            body.steamId,
+            1 if body.hasDlc else 0,
+            body.source,
+            1 if body.marme1adker else 0,
+            body.steampassUrl,
+            _j.dumps(body.tags, ensure_ascii=False),
+            _j.dumps(body.opts, ensure_ascii=False),
+            now,
+        ))
+        log_action(db, admin["id"], "add_game",
+                   detail=f"title={body.title}, steamId={body.steamId}, source={body.source}")
 
     return {
         "ok": True,
