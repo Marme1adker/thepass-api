@@ -1362,3 +1362,122 @@ async def bot_update_guard(job_id: str, request: Request):
         )
 
     return {"ok": True, "guard": guard_code}
+
+
+# ══════════════════════════════════════════════════════════════════
+# BANNER SYSTEM — хранение настроек баннеров
+# ══════════════════════════════════════════════════════════════════
+#
+# GET  /api/banners              — публичный, отдаёт настройки обоих слотов
+# POST /api/banners/{slot}       — только admin, сохраняет настройки слота
+# POST /api/banners/{slot}/upload — только admin, загружает файл картинки
+#
+# Данные хранятся в SQLite (таблица banner_settings, одна строка на слот).
+
+import json as _bjson
+
+def _init_banners_table():
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS banner_settings (
+                slot       TEXT PRIMARY KEY,   -- 'top' | 'side'
+                enabled    INTEGER NOT NULL DEFAULT 0,
+                image_url  TEXT NOT NULL DEFAULT '',
+                link_url   TEXT NOT NULL DEFAULT '',
+                alt        TEXT NOT NULL DEFAULT '',
+                height     INTEGER NOT NULL DEFAULT 90,
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        # Вставляем дефолтные строки если не существует
+        for slot in ('top', 'side'):
+            db.execute(
+                "INSERT OR IGNORE INTO banner_settings (slot, updated_at) VALUES (?, ?)",
+                (slot, datetime.utcnow().isoformat())
+            )
+
+_init_banners_table()
+
+BANNER_UPLOAD_DIR = Path(DB_DIR) / "uploads" / "banners"
+BANNER_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Публичный: получить оба слота ─────────────────────────────
+@app.get("/api/banners")
+async def get_banners():
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM banner_settings").fetchall()
+    result = {}
+    for row in rows:
+        row = dict(row)
+        slot = row.pop("slot")
+        row["enabled"] = bool(row["enabled"])
+        result[slot] = row
+    # Гарантируем оба ключа
+    for slot in ("top", "side"):
+        if slot not in result:
+            result[slot] = {
+                "enabled": False, "image_url": "", "link_url": "",
+                "alt": "", "height": 90, "updated_at": ""
+            }
+    return result
+
+
+class BannerUpdateRequest(BaseModel):
+    enabled:   bool   = False
+    image_url: str    = ""
+    link_url:  str    = ""
+    alt:       str    = ""
+    height:    int    = 90    # только для slot='top'
+
+
+# ── Сохранить настройки слота (только admin) ──────────────────
+@app.post("/api/banners/{slot}")
+async def update_banner(slot: str, body: BannerUpdateRequest, admin=Depends(require_admin)):
+    if slot not in ("top", "side"):
+        raise HTTPException(400, "slot должен быть 'top' или 'side'")
+    now = datetime.utcnow().isoformat()
+    h = max(40, min(300, body.height)) if slot == "top" else 90
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO banner_settings (slot, enabled, image_url, link_url, alt, height, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slot) DO UPDATE SET
+                enabled   = excluded.enabled,
+                image_url = excluded.image_url,
+                link_url  = excluded.link_url,
+                alt       = excluded.alt,
+                height    = excluded.height,
+                updated_at = excluded.updated_at
+        """, (slot, int(body.enabled), body.image_url.strip(), body.link_url.strip(), body.alt.strip(), h, now))
+        log_action(db, admin["id"], f"banner_update_{slot}",
+                   detail=f"enabled={body.enabled}, url={body.image_url[:60]}")
+    return {"ok": True}
+
+
+# ── Загрузка файла баннера (только admin) ─────────────────────
+@app.post("/api/banners/{slot}/upload")
+async def upload_banner_img(
+    slot: str,
+    file: UploadFile = File(...),
+    admin=Depends(require_admin)
+):
+    if slot not in ("top", "side"):
+        raise HTTPException(400, "slot должен быть 'top' или 'side'")
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        raise HTTPException(400, "Только JPEG, PNG, WebP или GIF")
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Максимум 10 МБ")
+
+    ext      = (file.filename or "img").rsplit(".", 1)[-1].lower()
+    fname    = f"banner_{slot}.{ext}"
+    fpath    = BANNER_UPLOAD_DIR / fname
+    async with aiofiles.open(fpath, "wb") as f:
+        await f.write(contents)
+
+    image_url = f"/uploads/banners/{fname}"
+    with get_db() as db:
+        log_action(db, admin["id"], f"banner_upload_{slot}", detail=image_url)
+
+    return {"ok": True, "image_url": image_url}
