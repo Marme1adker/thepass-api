@@ -1077,6 +1077,66 @@ async def admin_add_game(body: AdminAddGameRequest, admin=Depends(require_admin)
     }
 
 
+class AdminEditGameRequest(BaseModel):
+    title:        str | None   = None   # новое название (если нужно переименовать)
+    short:        str | None   = None
+    group:        str | None   = None
+    hasDlc:       bool | None  = None
+    source:       str | None   = None
+    marme1adker:  bool | None  = None
+    steamId:      int | None   = None
+    steampassUrl: str | None   = None
+    tags:         list[str] | None = None
+    opts:         list[str] | None = None
+
+
+@app.patch("/api/admin/games/{game_title}")
+async def admin_edit_game(game_title: str, body: AdminEditGameRequest, admin=Depends(require_admin)):
+    """
+    Редактирует существующую игру в каталоге по точному названию.
+    Обновляет только переданные поля (partial update).
+    """
+    import json as _j
+    from urllib.parse import unquote
+
+    game_title = unquote(game_title)
+
+    with get_db() as db:
+        row = db.execute("SELECT * FROM games WHERE title=?", (game_title,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Игра «{game_title}» не найдена")
+
+        # Строим SET-часть только из переданных полей
+        updates = {}
+        if body.title        is not None: updates["title"]         = body.title
+        if body.short        is not None: updates["short"]         = body.short
+        if body.group        is not None: updates["grp"]           = body.group
+        if body.hasDlc       is not None: updates["has_dlc"]       = 1 if body.hasDlc else 0
+        if body.source       is not None: updates["source"]        = body.source
+        if body.marme1adker  is not None: updates["marme1adker"]   = 1 if body.marme1adker else 0
+        if body.steamId      is not None: updates["steam_id"]      = body.steamId
+        if body.steampassUrl is not None: updates["steampass_url"] = body.steampassUrl
+        if body.tags         is not None: updates["tags"]          = _j.dumps(body.tags, ensure_ascii=False)
+        if body.opts         is not None: updates["opts"]          = _j.dumps(body.opts, ensure_ascii=False)
+
+        if not updates:
+            raise HTTPException(400, "Нет полей для обновления")
+
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values     = list(updates.values()) + [game_title]
+        db.execute(f"UPDATE games SET {set_clause} WHERE title=?", values)
+
+        final_title = body.title or game_title
+        log_action(db, admin["id"], "edit_game",
+                   detail=f"original={game_title}, updates={list(updates.keys())}")
+
+    return {
+        "ok": True,
+        "message": f"Игра «{final_title}» успешно обновлена",
+        "updated_fields": list(updates.keys()),
+    }
+
+
 
 # ══════════════════════════════════════════════════════════════════
 # СТАТИЧЕСКИЕ ФАЙЛЫ
