@@ -151,6 +151,19 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        # ── Очередь синхронизации подписок с ботом ───────────────
+        # Когда API выдаёт/отзывает подписку — пишет сюда запись.
+        # Бот поллит этот эндпоинт и применяет изменения локально.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sub_sync_queue (
+                id         TEXT PRIMARY KEY,
+                tg_uid     INTEGER NOT NULL,
+                action     TEXT NOT NULL,   -- 'grant' | 'revoke'
+                sub_until  TEXT,            -- ISO дата (для grant) или NULL (для revoke)
+                created_at TEXT NOT NULL,
+                processed  INTEGER NOT NULL DEFAULT 0
+            )
+        """)
     print("✅ БД инициализирована:", DB_PATH)
 
 
@@ -679,6 +692,12 @@ async def admin_set_sub(user_id: str, body: AdminSetSubRequest, admin=Depends(re
             row["tg_uid"],
             f"💎 Вам выдана подписка The Pass до *{end_str}*!"
         ))
+        # Сигналим боту что нужно обновить users_data.json
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO sub_sync_queue (id, tg_uid, action, sub_until, created_at) VALUES (?,?,?,?,?)",
+                (gen_id(), row["tg_uid"], "grant", new_until, datetime.utcnow().isoformat())
+            )
 
     return {"ok": True, "sub_until": new_until}
 
@@ -758,6 +777,12 @@ async def admin_reset_sub(user_id: str, admin=Depends(require_admin)):
             row["tg_uid"],
             "ℹ️ Ваша подписка The Pass была сброшена администратором."
         ))
+        # Сигналим боту что нужно обнулить подписку в users_data.json
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO sub_sync_queue (id, tg_uid, action, sub_until, created_at) VALUES (?,?,?,?,?)",
+                (gen_id(), row["tg_uid"], "revoke", None, datetime.utcnow().isoformat())
+            )
 
     return {"ok": True}
 
@@ -870,6 +895,27 @@ def _require_bot(request: Request):
     secret = request.headers.get("X-Bot-Secret", "")
     if secret != BOT_SECRET_KEY:
         raise HTTPException(403, "Forbidden")
+
+
+@app.get("/api/bot/sub-sync")
+async def bot_sub_sync(request: Request):
+    """
+    Бот вызывает каждые 10 сек — забирает необработанные события подписок.
+    Возвращает список {tg_uid, action, sub_until} и помечает их как обработанные.
+    """
+    _require_bot(request)
+    now = datetime.utcnow().isoformat()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM sub_sync_queue WHERE processed=0 ORDER BY created_at ASC"
+        ).fetchall()
+        if rows:
+            ids = [r["id"] for r in rows]
+            db.execute(
+                f"UPDATE sub_sync_queue SET processed=1 WHERE id IN ({','.join('?'*len(ids))})",
+                ids
+            )
+    return {"events": [{"tg_uid": r["tg_uid"], "action": r["action"], "sub_until": r["sub_until"]} for r in rows]}
 
 
 @app.get("/api/bot/search-jobs/next")
@@ -1248,33 +1294,9 @@ async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
     if not login:
         raise HTTPException(400, "login обязателен")
 
-    now = datetime.utcnow()
-
-    # Проверяем возраст search_job — бот ждёт Guard только 30 секунд.
-    # Если пользователь нажал кнопку после таймаута — сразу говорим об этом,
-    # guard_job НЕ создаём (бот его всё равно не обработает → зависший цикл).
-    if body.job_id:
-        with get_db() as db:
-            search_row = db.execute(
-                "SELECT created_at FROM search_jobs WHERE id=?", (body.job_id,)
-            ).fetchone()
-        if search_row:
-            try:
-                job_age = (now - datetime.fromisoformat(search_row["created_at"])).total_seconds()
-                if job_age > 30:
-                    raise HTTPException(
-                        410,
-                        "Время ожидания Guard истекло (30 сек). "
-                        "Пожалуйста, найдите игру заново и запросите Guard сразу после получения данных."
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass  # не ломаем flow если что-то пошло не так с парсингом даты
-
     # Удаляем старые задачи этого пользователя (чтобы не копились)
-    cutoff = (now - timedelta(minutes=5)).isoformat()
-    now_iso = now.isoformat()
+    now = datetime.utcnow().isoformat()
+    cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
     with get_db() as db:
         db.execute(
             "DELETE FROM guard_jobs WHERE user_id=? AND created_at<?",
@@ -1286,7 +1308,7 @@ async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
         db.execute(
             "INSERT INTO guard_jobs (id, login, game_title, user_id, search_job_id, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (guard_job_id, login, body.game_title or "", user["id"], body.job_id or None, now_iso, now_iso)
+            (guard_job_id, login, body.game_title or "", user["id"], body.job_id or None, now, now)
         )
         log_action(db, user["id"], "guard_request", detail=f"login={login}, job={guard_job_id}")
 
@@ -1578,4 +1600,3 @@ async def upload_banner_img(
         log_action(db, admin["id"], f"banner_upload_{slot}", detail=image_url)
 
     return {"ok": True, "image_url": image_url}
-    
