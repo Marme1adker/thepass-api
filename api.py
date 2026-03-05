@@ -1248,9 +1248,33 @@ async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
     if not login:
         raise HTTPException(400, "login обязателен")
 
+    now = datetime.utcnow()
+
+    # Проверяем возраст search_job — бот ждёт Guard только 30 секунд.
+    # Если пользователь нажал кнопку после таймаута — сразу говорим об этом,
+    # guard_job НЕ создаём (бот его всё равно не обработает → зависший цикл).
+    if body.job_id:
+        with get_db() as db:
+            search_row = db.execute(
+                "SELECT created_at FROM search_jobs WHERE id=?", (body.job_id,)
+            ).fetchone()
+        if search_row:
+            try:
+                job_age = (now - datetime.fromisoformat(search_row["created_at"])).total_seconds()
+                if job_age > 30:
+                    raise HTTPException(
+                        410,
+                        "Время ожидания Guard истекло (30 сек). "
+                        "Пожалуйста, найдите игру заново и запросите Guard сразу после получения данных."
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # не ломаем flow если что-то пошло не так с парсингом даты
+
     # Удаляем старые задачи этого пользователя (чтобы не копились)
-    now = datetime.utcnow().isoformat()
-    cutoff = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    cutoff = (now - timedelta(minutes=5)).isoformat()
+    now_iso = now.isoformat()
     with get_db() as db:
         db.execute(
             "DELETE FROM guard_jobs WHERE user_id=? AND created_at<?",
@@ -1262,7 +1286,7 @@ async def guard_start(body: GuardStartRequest, user=Depends(require_user)):
         db.execute(
             "INSERT INTO guard_jobs (id, login, game_title, user_id, search_job_id, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (guard_job_id, login, body.game_title or "", user["id"], body.job_id or None, now, now)
+            (guard_job_id, login, body.game_title or "", user["id"], body.job_id or None, now_iso, now_iso)
         )
         log_action(db, user["id"], "guard_request", detail=f"login={login}, job={guard_job_id}")
 
@@ -1310,14 +1334,6 @@ async def bot_guard_next(request: Request):
     _require_bot(request)
     now = datetime.utcnow().isoformat()
     with get_db() as db:
-        # Сначала автоматически истекаем jobs старше 35 секунд — они уже никому не нужны
-        stale_cutoff = (datetime.utcnow() - timedelta(seconds=35)).isoformat()
-        db.execute(
-            "UPDATE guard_jobs SET status='error', error='Время ожидания истекло', updated_at=? "
-            "WHERE status='pending' AND created_at < ?",
-            (now, stale_cutoff)
-        )
-
         row = db.execute(
             "SELECT * FROM guard_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
@@ -1328,12 +1344,7 @@ async def bot_guard_next(request: Request):
             "UPDATE guard_jobs SET status='processing', updated_at=? WHERE id=?",
             (now, row["id"])
         )
-    return {"job": {
-        "id":         row["id"],
-        "login":      row["login"],
-        "game_title": row["game_title"],
-        "created_at": row["created_at"],   # нужен боту для проверки возраста
-    }}
+    return {"job": {"id": row["id"], "login": row["login"], "game_title": row["game_title"]}}
 
 
 # ── 4. Бот записывает результат ───────────────────────────────────
@@ -1567,3 +1578,4 @@ async def upload_banner_img(
         log_action(db, admin["id"], f"banner_upload_{slot}", detail=image_url)
 
     return {"ok": True, "image_url": image_url}
+    
