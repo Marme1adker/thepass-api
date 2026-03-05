@@ -151,19 +151,6 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
-        # ── Очередь синхронизации подписок с ботом ───────────────
-        # Когда API выдаёт/отзывает подписку — пишет сюда запись.
-        # Бот поллит этот эндпоинт и применяет изменения локально.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS sub_sync_queue (
-                id         TEXT PRIMARY KEY,
-                tg_uid     INTEGER NOT NULL,
-                action     TEXT NOT NULL,   -- 'grant' | 'revoke'
-                sub_until  TEXT,            -- ISO дата (для grant) или NULL (для revoke)
-                created_at TEXT NOT NULL,
-                processed  INTEGER NOT NULL DEFAULT 0
-            )
-        """)
     print("✅ БД инициализирована:", DB_PATH)
 
 
@@ -692,12 +679,6 @@ async def admin_set_sub(user_id: str, body: AdminSetSubRequest, admin=Depends(re
             row["tg_uid"],
             f"💎 Вам выдана подписка The Pass до *{end_str}*!"
         ))
-        # Сигналим боту что нужно обновить users_data.json
-        with get_db() as db:
-            db.execute(
-                "INSERT INTO sub_sync_queue (id, tg_uid, action, sub_until, created_at) VALUES (?,?,?,?,?)",
-                (gen_id(), row["tg_uid"], "grant", new_until, datetime.utcnow().isoformat())
-            )
 
     return {"ok": True, "sub_until": new_until}
 
@@ -777,12 +758,6 @@ async def admin_reset_sub(user_id: str, admin=Depends(require_admin)):
             row["tg_uid"],
             "ℹ️ Ваша подписка The Pass была сброшена администратором."
         ))
-        # Сигналим боту что нужно обнулить подписку в users_data.json
-        with get_db() as db:
-            db.execute(
-                "INSERT INTO sub_sync_queue (id, tg_uid, action, sub_until, created_at) VALUES (?,?,?,?,?)",
-                (gen_id(), row["tg_uid"], "revoke", None, datetime.utcnow().isoformat())
-            )
 
     return {"ok": True}
 
@@ -895,27 +870,6 @@ def _require_bot(request: Request):
     secret = request.headers.get("X-Bot-Secret", "")
     if secret != BOT_SECRET_KEY:
         raise HTTPException(403, "Forbidden")
-
-
-@app.get("/api/bot/sub-sync")
-async def bot_sub_sync(request: Request):
-    """
-    Бот вызывает каждые 10 сек — забирает необработанные события подписок.
-    Возвращает список {tg_uid, action, sub_until} и помечает их как обработанные.
-    """
-    _require_bot(request)
-    now = datetime.utcnow().isoformat()
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT * FROM sub_sync_queue WHERE processed=0 ORDER BY created_at ASC"
-        ).fetchall()
-        if rows:
-            ids = [r["id"] for r in rows]
-            db.execute(
-                f"UPDATE sub_sync_queue SET processed=1 WHERE id IN ({','.join('?'*len(ids))})",
-                ids
-            )
-    return {"events": [{"tg_uid": r["tg_uid"], "action": r["action"], "sub_until": r["sub_until"]} for r in rows]}
 
 
 @app.get("/api/bot/search-jobs/next")
@@ -1445,6 +1399,73 @@ async def bot_guard_skip(guard_job_id: str, request: Request):
             (now, guard_job_id)
         )
     return {"ok": True}
+
+
+# ── Бот опрашивает статус guard_job (для поллинга из main.py) ──────
+
+@app.get("/api/bot/guard-jobs/{guard_job_id}/status")
+async def bot_guard_job_status(guard_job_id: str, request: Request):
+    """Бот опрашивает статус своего guard_job после нажатия кнопки в ЛС."""
+    _require_bot(request)
+    with get_db() as db:
+        row = db.execute(
+            "SELECT status, guard_code, expires_in, error FROM guard_jobs WHERE id=?",
+            (guard_job_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Guard задача не найдена")
+    if row["status"] == "done":
+        return {"status": "done", "guard": row["guard_code"], "expires_in": row["expires_in"] or 30}
+    elif row["status"] == "error":
+        return {"status": "error", "error": row["error"] or "Неизвестная ошибка"}
+    return {"status": "pending"}
+
+
+# ── Бот создаёт guard_job от имени пользователя (при нажатии кнопки в ЛС) ──
+
+@app.post("/api/bot/guard-start")
+async def bot_guard_start(request: Request):
+    """
+    Бот вызывает когда пользователь нажал кнопку Guard в Telegram ЛС.
+    Создаёт guard_job с search_job_id — catalog_worker подхватит его
+    и нажмёт кнопку в браузере (точно так же как при запросе с сайта).
+    """
+    _require_bot(request)
+    body          = await request.json()
+    search_job_id = body.get("search_job_id", "").strip()
+    if not search_job_id:
+        raise HTTPException(400, "search_job_id обязателен")
+
+    with get_db() as db:
+        # Берём login и user_id из search_job
+        row = db.execute(
+            "SELECT user_id, query FROM search_jobs WHERE id=?", (search_job_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "search_job не найден")
+
+        # Берём login из результата поиска
+        result_row = db.execute(
+            "SELECT result FROM search_jobs WHERE id=?", (search_job_id,)
+        ).fetchone()
+        login = ""
+        if result_row and result_row["result"]:
+            try:
+                import json as _json
+                res = _json.loads(result_row["result"])
+                login = res.get("login", "")
+            except Exception:
+                pass
+
+        now = datetime.utcnow().isoformat()
+        guard_job_id = gen_id()
+        db.execute(
+            "INSERT INTO guard_jobs (id, login, game_title, user_id, search_job_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (guard_job_id, login, row["query"] or "", row["user_id"], search_job_id, now, now)
+        )
+
+    return {"ok": True, "guard_job_id": guard_job_id}
 
 
 # ── 7. Бот обновляет Guard в результате поиска ───────────────────
