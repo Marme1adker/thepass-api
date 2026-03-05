@@ -949,6 +949,7 @@ async def get_games():
     result = []
     for r in rows:
         result.append({
+            "id":           r["id"],        # ← добавлен для надёжного редактирования
             "title":        r["title"],
             "short":        r["short"],
             "group":        r["grp"],
@@ -1090,21 +1091,33 @@ class AdminEditGameRequest(BaseModel):
     opts:         list[str] | None = None
 
 
-@app.patch("/api/admin/games/{game_title}")
-async def admin_edit_game(game_title: str, body: AdminEditGameRequest, admin=Depends(require_admin)):
+@app.patch("/api/admin/games/{game_id}")
+async def admin_edit_game(game_id: str, body: AdminEditGameRequest, admin=Depends(require_admin)):
     """
-    Редактирует существующую игру в каталоге по точному названию.
+    Редактирует существующую игру в каталоге.
+    game_id может быть числовым id ИЛИ названием игры (URL-encoded).
     Обновляет только переданные поля (partial update).
     """
     import json as _j
     from urllib.parse import unquote
 
-    game_title = unquote(game_title)
+    game_id = unquote(game_id)
 
     with get_db() as db:
-        row = db.execute("SELECT * FROM games WHERE title=?", (game_title,)).fetchone()
+        # Сначала пробуем найти по числовому id
+        row = None
+        if game_id.isdigit():
+            row = db.execute("SELECT * FROM games WHERE id=?", (int(game_id),)).fetchone()
+        # Если не нашли — ищем по title (COLLATE NOCASE + strip)
         if not row:
-            raise HTTPException(404, f"Игра «{game_title}» не найдена")
+            row = db.execute(
+                "SELECT * FROM games WHERE TRIM(title)=TRIM(?) COLLATE NOCASE",
+                (game_id,)
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Игра «{game_id}» не найдена в БД")
+
+        actual_title = row["title"]
 
         # Строим SET-часть только из переданных полей
         updates = {}
@@ -1123,12 +1136,12 @@ async def admin_edit_game(game_title: str, body: AdminEditGameRequest, admin=Dep
             raise HTTPException(400, "Нет полей для обновления")
 
         set_clause = ", ".join(f"{k}=?" for k in updates)
-        values     = list(updates.values()) + [game_title]
-        db.execute(f"UPDATE games SET {set_clause} WHERE title=?", values)
+        values     = list(updates.values()) + [row["id"]]
+        db.execute(f"UPDATE games SET {set_clause} WHERE id=?", values)
 
-        final_title = body.title or game_title
+        final_title = body.title or actual_title
         log_action(db, admin["id"], "edit_game",
-                   detail=f"original={game_title}, updates={list(updates.keys())}")
+                   detail=f"id={row['id']}, original={actual_title}, updates={list(updates.keys())}")
 
     return {
         "ok": True,
