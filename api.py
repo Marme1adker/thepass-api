@@ -1310,6 +1310,14 @@ async def bot_guard_next(request: Request):
     _require_bot(request)
     now = datetime.utcnow().isoformat()
     with get_db() as db:
+        # Сначала автоматически истекаем jobs старше 35 секунд — они уже никому не нужны
+        stale_cutoff = (datetime.utcnow() - timedelta(seconds=35)).isoformat()
+        db.execute(
+            "UPDATE guard_jobs SET status='error', error='Время ожидания истекло', updated_at=? "
+            "WHERE status='pending' AND created_at < ?",
+            (now, stale_cutoff)
+        )
+
         row = db.execute(
             "SELECT * FROM guard_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
@@ -1320,7 +1328,12 @@ async def bot_guard_next(request: Request):
             "UPDATE guard_jobs SET status='processing', updated_at=? WHERE id=?",
             (now, row["id"])
         )
-    return {"job": {"id": row["id"], "login": row["login"], "game_title": row["game_title"]}}
+    return {"job": {
+        "id":         row["id"],
+        "login":      row["login"],
+        "game_title": row["game_title"],
+        "created_at": row["created_at"],   # нужен боту для проверки возраста
+    }}
 
 
 # ── 4. Бот записывает результат ───────────────────────────────────
