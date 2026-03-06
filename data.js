@@ -381,12 +381,9 @@ const _localGames = [
 // ── Загрузка игр — API-first ─────────────────────────────────────
 //
 //  Логика:
-//   1. Пробуем загрузить весь каталог из API (Railway) — единый источник правды.
-//   2. Если API недоступен (нет сети, Railway спит) — fallback на _localGames.
-//   3. _localGames используется ТОЛЬКО как резервная копия и для первичного seed.
-//
-//  Seed (одноразово, делается из консоли или AdminPanel):
-//    AdminSeed.run()   — заливает _localGames в БД, пропускает уже существующие.
+//   1. Пробуем загрузить каталог из API (Railway) за 8 секунд.
+//   2. Если API недоступен / таймаут / пустая БД — fallback на _localGames.
+//   3. После первого запуска нужно сделать AdminSeed.run() для заполнения БД.
 //
 async function fetchGames() {
   const apiBase =
@@ -397,26 +394,40 @@ async function fetchGames() {
         : 'https://thepass-api.up.railway.app';
 
   try {
-    const res = await fetch(`${apiBase}/api/games`);
+    // Таймаут 8 секунд — Railway иногда засыпает и долго просыпается
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 8000);
+
+    let res;
+    try {
+      res = await fetch(`${apiBase}/api/games`, { signal: controller.signal });
+    } finally {
+      clearTimeout(tid);
+    }
+
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const apiGames = await res.json();
 
-    if (apiGames && apiGames.length > 0) {
+    if (Array.isArray(apiGames) && apiGames.length > 0) {
       // API — единственный источник правды.
-      // Добавляем img из steamId если не пришёл с сервера.
+      // Нормализуем: добавляем img, гарантируем group не пустой.
       return apiGames.map(g => ({
         ...g,
-        img: g.img || steamImg(g.steamId),
+        group: g.group || 'Инди • Разное',
+        img:   g.img   || steamImg(g.steamId),
       }));
     }
 
     // API вернул пустой массив — БД ещё не заполнена.
-    // Возвращаем локальные данные и подсказываем сделать seed.
-    console.warn('[fetchGames] API вернул пустой список. Запусти AdminSeed.run() для первичного импорта.');
+    console.warn('[fetchGames] БД пустая. Используем локальные данные. Запусти AdminSeed.run() для импорта.');
     return _localGames;
 
   } catch (e) {
-    console.warn('[fetchGames] API недоступен, работаем локально:', e.message);
+    if (e.name === 'AbortError') {
+      console.warn('[fetchGames] Таймаут API (8с). Работаем локально.');
+    } else {
+      console.warn('[fetchGames] API недоступен, работаем локально:', e.message);
+    }
     return _localGames;
   }
 }
